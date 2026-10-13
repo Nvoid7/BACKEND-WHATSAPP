@@ -14,7 +14,7 @@ const ID = /^[A-Za-z0-9_.-]{2,40}$/;
 fs.mkdirSync(DATA_DIR, { recursive: true });
 
 const http = createServer((q, r) => { if (q.url === '/health') { r.writeHead(200, { 'content-type': 'application/json' }); r.end('{"ok":true}'); } else { r.writeHead(404); r.end(); } });
-const io = new Server(http, { cors: { origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',') }, maxHttpBufferSize: 1e6 });
+const io = new Server(http, { cors: { origin: CORS_ORIGIN === '*' ? true : CORS_ORIGIN.split(',') }, maxHttpBufferSize: 20e6 });
 const nsp = io.of('/wa');
 const same = (a, b) => { a = Buffer.from(String(a)); b = Buffer.from(String(b)); return a.length === b.length && crypto.timingSafeEqual(a, b); };
 
@@ -136,6 +136,7 @@ class Session {
     if (inner.conversation) x = inner.conversation;
     else if (inner.extendedTextMessage) x = inner.extendedTextMessage.text || '';
     else if (inner.imageMessage) { t = 'media'; l = '📷 Foto'; x = inner.imageMessage.caption || ''; }
+    else if (inner.ptvMessage) { t = 'media'; l = '⭕ Video note'; }
     else if (inner.videoMessage) { t = 'media'; l = '🎥 Video'; x = inner.videoMessage.caption || ''; }
     else if (inner.audioMessage) { t = 'media'; l = inner.audioMessage.ptt ? '🎤 Pesan suara' : '🎵 Audio'; }
     else if (inner.documentMessage) { t = 'media'; l = '📄 ' + (inner.documentMessage.fileName || 'Dokumen'); x = inner.documentMessage.caption || ''; }
@@ -160,6 +161,18 @@ class Session {
   }
   pushAll() { this.emit('chats', this.list()); this.save(); }
   list() { return [...this.chats.values()].sort((a, b) => ((b.pin | 0) - (a.pin | 0)) || (b.ts - a.ts)).slice(0, 300); }
+  async sendVnote(id, data) {
+    if (!this.sock || this.st.st !== 'open') return { e: 'WhatsApp belum tersambung' };
+    const buf = Buffer.isBuffer(data) ? data : (data instanceof ArrayBuffer ? Buffer.from(data) : null);
+    if (!buf || buf.length < 1000) return { e: 'File video tidak valid' };
+    if (buf.length > 15 * 1024 * 1024) return { e: 'Video terlalu besar (maks 15 MB)' };
+    if (buf.slice(4, 8).toString('latin1') !== 'ftyp') return { e: 'Bukan file MP4 yang valid' };
+    try {
+      const jid = jidNormalizedUser(id); const r = await this.sock.sendMessage(jid, { video: buf, ptv: true, mimetype: 'video/mp4' });
+      this.addMsg(r, false); const m = (this.msgs.get(jid) || []).find(x => x.id === r.key.id);
+      return { ok: 1, m: m || { id: r.key.id, me: 1, t: 'media', x: '', l: '⭕ Video note', ts: Date.now(), s: 1, w: '' } };
+    } catch (e) { console.log('[wa]', this.u, 'vnote gagal:', e && e.message); return { e: 'Gagal mengirim video note' }; }
+  }
   async send(id, text) {
     if (!this.sock || this.st.st !== 'open') return { e: 'WhatsApp belum tersambung' };
     text = String(text || '').slice(0, 4000); if (!text.trim()) return { e: 'Pesan kosong' };
@@ -196,6 +209,7 @@ nsp.on('connection', (sock) => {
     try { const arr = s.msgs.get(id) || []; const last = arr[arr.length - 1]; if (s.sock && s.st.st === 'open' && last && !last.me) await s.sock.readMessages([{ remoteJid: id, id: last.id, fromMe: false, participant: undefined }]); } catch { /* abaikan */ }
     ok(cb)({ list: s.msgs.get(id) || [], name: c ? c.name : s.disp(id), g: c ? c.g : 0 });
   });
+  sock.on('vnote', async (d, cb) => ok(cb)(await s.sendVnote(d && d.id, d && d.data)));
   sock.on('send', async (d, cb) => ok(cb)(await s.send(d && d.id, d && d.text)));
   sock.on('typing', async (d) => { try { if (s.sock && s.st.st === 'open' && d && d.id) await s.sock.sendPresenceUpdate(d.on ? 'composing' : 'paused', d.id); } catch { /* */ } });
   sock.on('newchat', async (d, cb) => {
@@ -215,3 +229,4 @@ nsp.on('connection', (sock) => {
 for (const u of fs.readdirSync(DATA_DIR)) { if (ID.test(u) && fs.existsSync(path.join(DATA_DIR, u, 'auth', 'creds.json'))) { const s = get(u); if (s.st.st === 'connecting') s.start().catch(e => log.warn(e)); } }
 process.on('unhandledRejection', (e) => log.warn(e));
 http.listen(+PORT, () => console.log('DevConnect WA server :' + PORT));
+       
