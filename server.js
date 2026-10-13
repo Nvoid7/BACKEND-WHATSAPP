@@ -6,7 +6,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { Server } from 'socket.io';
 import pino from 'pino';
-import makeWASocket, { useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason, jidNormalizedUser, isJidGroup, isJidBroadcast, isJidStatusBroadcast } from '@whiskeysockets/baileys';
+import makeWASocket, { Browsers, useMultiFileAuthState, fetchLatestBaileysVersion, DisconnectReason, jidNormalizedUser, isJidGroup, isJidBroadcast, isJidStatusBroadcast } from '@whiskeysockets/baileys';
 
 const { APP_KEY = '', PORT = '3100', DATA_DIR = './data', CORS_ORIGIN = '*' } = process.env;
 const log = pino({ level: 'warn' });
@@ -56,7 +56,7 @@ class Session {
     if (this.sock || this.stopped) return;
     const { state, saveCreds } = await useMultiFileAuthState(path.join(this.dir, 'auth'));
     let version; try { version = (await fetchLatestBaileysVersion()).version; } catch { /* pakai bawaan */ }
-    const sock = this.sock = makeWASocket({ version, auth: state, logger: pino({ level: 'silent' }), printQRInTerminal: false, browser: ['Chrome (Linux)', 'Chrome', '120.0.0'], syncFullHistory: false, markOnlineOnConnect: false, generateHighQualityLinkPreview: false });
+    const sock = this.sock = makeWASocket({ version, auth: state, logger: pino({ level: 'silent' }), printQRInTerminal: false, browser: Browsers.ubuntu('Chrome'), syncFullHistory: false, markOnlineOnConnect: false, generateHighQualityLinkPreview: false });
     sock.ev.on('creds.update', saveCreds);
     sock.ev.on('connection.update', (u) => this.onConn(sock, u));
     sock.ev.on('messaging-history.set', (h) => { (h.contacts || []).forEach(c => this.name(c)); (h.chats || []).forEach(c => this.upChat(c.id, { name: c.name, ts: (Number(c.conversationTimestamp) || 0) * 1000, un: c.unreadCount | 0 })); (h.messages || []).forEach(m => this.addMsg(m, true)); this.pushAll(); });
@@ -70,12 +70,18 @@ class Session {
   async onConn(sock, u) {
     if (sock !== this.sock) return;
     const { connection, lastDisconnect } = u;
+    if (connection) console.log('[wa]', this.u, 'conn', connection);
+    if (u.qr && this.pairing && this.pairWait && !this.pairWait.asked) {            // minta kode saat handshake siap (cara resmi Baileys)
+      this.pairWait.asked = true; console.log('[wa]', this.u, 'minta kode');
+      sock.requestPairingCode(this.pairing).then((c) => { console.log('[wa]', this.u, 'kode dibuat'); this.pairWait && this.pairWait.done({ code: c.length === 8 ? c.slice(0, 4) + '-' + c.slice(4) : c }); })
+        .catch((e) => { console.log('[wa]', this.u, 'gagal minta kode:', e && e.message); this.pairWait && this.pairWait.done({ e: 'Gagal meminta kode: ' + (e && e.message || 'coba lagi') }); });
+    }
     if (connection === 'open') { this.retry = 0; this.pairing = null; this.setSt({ st: 'open' }); try { await sock.sendPresenceUpdate('unavailable'); } catch { /* abaikan */ } }
     if (connection === 'connecting' && this.st.st === 'none' && !this.pairing) this.setSt({ st: 'connecting' });
     if (connection === 'close') {
       this.sock = null;
       const code = lastDisconnect && lastDisconnect.error && lastDisconnect.error.output && lastDisconnect.error.output.statusCode;
-      console.log('[wa]', this.u, 'close', code, this.pairing ? '(pairing)' : '');
+      console.log('[wa]', this.u, 'close', code, lastDisconnect && lastDisconnect.error && lastDisconnect.error.message, this.pairing ? '(pairing)' : '');
       if (this.stopped) return;
       if (code === DisconnectReason.loggedOut) return this.wipe('Sesi diputus dari WhatsApp');
       if (this.pairing && code === DisconnectReason.restartRequired) { this.start(); return; }   // normal setelah kode dimasukkan
@@ -91,13 +97,16 @@ class Session {
     if (phone.length < 8 || phone.length > 15) return { e: 'Nomor tidak valid (pakai kode negara, tanpa +)' };
     if (this.st.st === 'open') return { e: 'Sudah tertaut' };
     await this.drop(); try { fs.rmSync(path.join(this.dir, 'auth'), { recursive: true, force: true }); } catch { /* */ }
-    this.stopped = false; this.pairing = phone; await this.start();
-    try {
-      await new Promise(r => setTimeout(r, 2500));                       // tunggu socket siap sebelum minta kode
-      const code = await this.sock.requestPairingCode(phone);
-      this.setSt({ st: 'pairing', code: code.length === 8 ? code.slice(0, 4) + '-' + code.slice(4) : code });
-      return { code: this.st.code };
-    } catch (e) { this.pairing = null; await this.drop(); return { e: 'Gagal meminta kode: ' + (e && e.message || 'coba lagi') }; }
+    this.stopped = false; this.pairing = phone;
+    const res = await new Promise((resolve) => {
+      const t = setTimeout(() => done({ e: 'Server WhatsApp tidak merespons, coba lagi' }), 25000);
+      const done = (r) => { clearTimeout(t); this.pairWait = null; resolve(r); };
+      this.pairWait = { done, asked: false };
+      this.start().catch((e) => done({ e: 'Gagal memulai: ' + (e && e.message) }));
+    });
+    if (res.e) { this.pairing = null; await this.drop(); return res; }
+    this.setSt({ st: 'pairing', code: res.code });
+    return { code: res.code };
   }
   async drop() { const s = this.sock; this.sock = null; if (s) { try { s.ev.removeAllListeners(); s.end(undefined); } catch { /* */ } } }
   async wipe(err) {
@@ -129,6 +138,84 @@ class Session {
     else if (inner.imageMessage) { t = 'media'; l = '📷 Foto'; x = inner.imageMessage.caption || ''; }
     else if (inner.videoMessage) { t = 'media'; l = '🎥 Video'; x = inner.videoMessage.caption || ''; }
     else if (inner.audioMessage) { t = 'media'; l = inner.audioMessage.ptt ? '🎤 Pesan suara' : '🎵 Audio'; }
+    else if (inner.documentMessage) { t = 'media'; l = '📄 ' + (inner.documentMessage.fileName || 'Dokumen'); x = inner.documentMessage.caption || ''; }
+    else if (inner.stickerMessage) { t = 'media'; l = 'Stiker'; }
+    else if (inner.contactMessage) { t = 'media'; l = '👤 Kontak'; }
+    else if (inner.locationMessage) { t = 'media'; l = '📍 Lokasi'; }
+    else if (inner.reactionMessage || inner.protocolMessage || inner.senderKeyDistributionMessage) return null;
+    else { t = 'media'; l = 'Pesan tidak didukung'; }
+    return { id: k.id, me: k.fromMe ? 1 : 0, t, x, l, ts: (Number(m.messageTimestamp) || Math.floor(Date.now() / 1000)) * 1000, s: this.mapSt(m.status) | 0, w: k.fromMe ? '' : (m.pushName || '') };
+  }
+  addMsg(raw, history, live) {
+    const jid = raw.key && raw.key.remoteJid && jidNormalizedUser(raw.key.remoteJid); if (!jid) return;
+    const pm = this.parse(raw); if (!pm) return;
+    if (raw.pushName && !raw.key.fromMe && !isJidGroup(jid)) { this.names.set(jid, this.names.get(jid) || raw.pushName); }
+    const c = this.upChat(jid, {}); if (!c) return;
+    const arr = this.msgs.get(jid) || []; if (arr.some(x => x.id === pm.id)) return;
+    arr.push(pm); arr.sort((a, b) => a.ts - b.ts); while (arr.length > MAXM) arr.shift(); this.msgs.set(jid, arr);
+    if (pm.ts >= c.ts) { c.ts = pm.ts; c.last = pm.l || pm.x; c.lm = pm.me; c.ls = pm.s; }
+    if (!history && !pm.me && live !== false) c.un = (c.un | 0) + 1;
+    if (!history) { this.emit('msg', { id: jid, m: pm }); this.emit('chat', c); }
+    this.save();
+  }
+  pushAll() { this.emit('chats', this.list()); this.save(); }
+  list() { return [...this.chats.values()].sort((a, b) => ((b.pin | 0) - (a.pin | 0)) || (b.ts - a.ts)).slice(0, 300); }
+  async send(id, text) {
+    if (!this.sock || this.st.st !== 'open') return { e: 'WhatsApp belum tersambung' };
+    text = String(text || '').slice(0, 4000); if (!text.trim()) return { e: 'Pesan kosong' };
+    try {
+      const jid = jidNormalizedUser(id); const r = await this.sock.sendMessage(jid, { text });
+      this.addMsg(r, false); const arr = this.msgs.get(jid) || []; const m = arr.find(x => x.id === r.key.id);
+      return { ok: 1, m: m || { id: r.key.id, me: 1, t: 'text', x: text, l: '', ts: Date.now(), s: 1, w: '' } };
+    } catch (e) { return { e: 'Gagal mengirim' }; }
+  }
+}
+const get = (u) => { let s = sessions.get(u); if (!s) { s = new Session(u); sessions.set(u, s); } return s; };
+
+/* ---------- Socket.IO /wa ---------- */
+nsp.use((sock, next) => {
+  const { key = '', u = '', sk = '' } = sock.handshake.auth || {};
+  if (APP_KEY && !same(key, APP_KEY)) return next(new Error('key'));
+  if (!ID.test(u) || !/^[A-Za-z0-9]{32,64}$/.test(sk)) return next(new Error('bad'));
+  const s = get(u);
+  if (s.sk && !same(s.sk, sk)) return next(new Error('locked'));    // sesi sudah dipegang perangkat lain
+  if (!s.sk) { s.sk = sk; s.save(); }
+  sock.data.u = u; next();
+});
+nsp.on('connection', (sock) => {
+  const s = get(sock.data.u); sock.join('u:' + s.u);
+  if (s.st.st === 'connecting' && !s.sock) s.start();
+  const ok = (cb) => typeof cb === 'function' ? cb : () => {};
+  sock.on('state', (_, cb) => ok(cb)(s.st));
+  sock.on('pair', async (d, cb) => ok(cb)(await s.pair(d && d.phone)));
+  sock.on('logout', async (_, cb) => { await s.logout(); ok(cb)({ ok: 1 }); });
+  sock.on('chats', (_, cb) => ok(cb)(s.list()));
+  sock.on('msgs', async (d, cb) => {
+    const id = d && String(d.id || ''); if (!id) return ok(cb)({});
+    const c = s.chats.get(id); if (c && c.un) { c.un = 0; s.emit('chat', c); s.save(); }
+    try { const arr = s.msgs.get(id) || []; const last = arr[arr.length - 1]; if (s.sock && s.st.st === 'open' && last && !last.me) await s.sock.readMessages([{ remoteJid: id, id: last.id, fromMe: false, participant: undefined }]); } catch { /* abaikan */ }
+    ok(cb)({ list: s.msgs.get(id) || [], name: c ? c.name : s.disp(id), g: c ? c.g : 0 });
+  });
+  sock.on('send', async (d, cb) => ok(cb)(await s.send(d && d.id, d && d.text)));
+  sock.on('typing', async (d) => { try { if (s.sock && s.st.st === 'open' && d && d.id) await s.sock.sendPresenceUpdate(d.on ? 'composing' : 'paused', d.id); } catch { /* */ } });
+  sock.on('newchat', async (d, cb) => {
+    const n = String(d && d.phone || '').replace(/\D/g, ''); if (n.length < 8 || n.length > 15) return ok(cb)({ e: 'Nomor tidak valid' });
+    try { if (!s.sock || s.st.st !== 'open') return ok(cb)({ e: 'WhatsApp belum tersambung' }); const r = await s.sock.onWhatsApp(n); if (!r || !r[0] || !r[0].exists) return ok(cb)({ e: 'Nomor tidak terdaftar di WhatsApp' });
+      const id = jidNormalizedUser(r[0].jid); const c = s.upChat(id, {}); s.emit('chat', c); ok(cb)({ id, name: c.name });
+    } catch { ok(cb)({ e: 'Gagal memeriksa nomor' }); }
+  });
+  sock.on('avatar', async (d, cb) => {
+    const id = d && String(d.id || ''); if (!id || !s.sock || s.st.st !== 'open') return ok(cb)({});
+    if (s.avc.has(id)) return ok(cb)({ url: s.avc.get(id) });
+    try { const url = await s.sock.profilePictureUrl(id, 'preview'); s.avc.set(id, url || ''); ok(cb)({ url: url || '' }); } catch { s.avc.set(id, ''); ok(cb)({}); }
+  });
+});
+
+/* ---------- pulihkan sesi tersimpan saat server restart ---------- */
+for (const u of fs.readdirSync(DATA_DIR)) { if (ID.test(u) && fs.existsSync(path.join(DATA_DIR, u, 'auth', 'creds.json'))) { const s = get(u); if (s.st.st === 'connecting') s.start().catch(e => log.warn(e)); } }
+process.on('unhandledRejection', (e) => log.warn(e));
+http.listen(+PORT, () => console.log('DevConnect WA server :' + PORT));
+}
     else if (inner.documentMessage) { t = 'media'; l = '📄 ' + (inner.documentMessage.fileName || 'Dokumen'); x = inner.documentMessage.caption || ''; }
     else if (inner.stickerMessage) { t = 'media'; l = 'Stiker'; }
     else if (inner.contactMessage) { t = 'media'; l = '👤 Kontak'; }
